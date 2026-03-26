@@ -41,20 +41,23 @@ def species_generator(
                     habitat_maps_path,
                     data_dir / "elevation-max.tif",
                     data_dir / "elevation-min.tif",
-                    data_dir / "area-per-pixel.tif",
+                    # data_dir / "area-per-pixel.tif",
                     data_dir / "crosswalk.csv",
                     species,
                     aohs_path / scenario / taxa,
                 ])
 
     df = pd.DataFrame(res, columns=[
-        '--habitats',
+        # '--habitats',
+        # '--classified_habitat',
+        '--fractional_habitats',
         '--elevation-max',
         '--elevation-min',
-        '--area',
+        # '--area',
+        # '--pixel-area',
         '--crosswalk',
         '--speciesdata',
-        '--output'
+        '--output',
     ])
     df.to_csv(output_csv_path, index=False)
 

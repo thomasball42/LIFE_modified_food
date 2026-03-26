@@ -10,6 +10,10 @@ from alive_progress import alive_bar # type: ignore
 from yirgacheffe.layers import RasterLayer # type: ignore
 
 from osgeo import gdal # type: ignore
+import os
+
+# os.environ['TMPDIR'] = '/tmp'
+# gdal.SetConfigOption('CPL_TMPDIR', '/tmp')
 gdal.SetCacheMax(1 * 1024 * 1024 * 1024)
 
 # From Eyres et al: The current layer maps IUCN level 1 and 2 habitats, but habitats in the PNV layer are mapped
