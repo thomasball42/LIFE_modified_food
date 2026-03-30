@@ -4,13 +4,16 @@ import os
 import shutil
 import sys
 from enum import Enum
+from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Union
+from typing import Optional, Union
 
 import geopandas as gpd
 import numpy as np
 from osgeo import gdal
 from yirgacheffe.layers import RasterLayer, ConstantLayer
+
+from aoh import IUCNFormatFilename
 
 GOMPERTZ_A = 2.5
 GOMPERTZ_B = -14.5
@@ -27,7 +30,18 @@ def gen_gompertz(x: float) -> float:
 def numpy_gompertz(x: float) -> float:
     return np.exp(-np.exp(GOMPERTZ_A + (GOMPERTZ_B * (x ** GOMPERTZ_ALPHA))))
 
-def open_layer_as_float64(filename: str) -> Union[ConstantLayer,RasterLayer]:
+def find_layer_path(directory: str, taxon_id: int, season: Season) -> Optional[Path]:
+    """Search directory for a .tif matching taxon_id and season using IUCNFormatFilename."""
+    for path in Path(directory).glob("**/*.tif"):
+        try:
+            parts = IUCNFormatFilename.of_filename(path)
+        except ValueError:
+            continue
+        if parts.taxon_id == taxon_id and parts.season == season.name:
+            return path
+    return None
+
+def open_layer_as_float64(filename: str) -> Union[ConstantLayer, RasterLayer]:
     if filename == "nan":
         return ConstantLayer(0.0)
     layer = RasterLayer.layer_from_file(filename)
@@ -43,19 +57,12 @@ def calc_persistence_value(current_aoh: float, historic_aoh: float, exponent_fun
     return sp_p_fix
 
 def process_delta_p(
-    current: Union[ConstantLayer,RasterLayer],
-    scenario: Union[ConstantLayer,RasterLayer],
+    current: Union[ConstantLayer, RasterLayer],
+    scenario: Union[ConstantLayer, RasterLayer],
     current_aoh: float,
     historic_aoh: float,
     exponent_func_raster
 ) -> RasterLayer:
-    # In theory we could recalc current_aoh, but given we already have it don't duplicate work
-    # New section added in: Calculating for rasters rather than csv's
-
-
-    new_p = ((ConstantLayer(current_aoh) - current) + scenario) / historic_aoh
-
-
     const_layer = ConstantLayer(current_aoh)
     calc_1 = (const_layer - current) + scenario
     new_aoh = RasterLayer.empty_raster_layer_like(current)
@@ -81,9 +88,9 @@ def global_code_residents_pixel_ae(
     os.environ["OGR_GEOJSON_MAX_OBJ_SIZE"] = "0"
     try:
         filtered_species_info = gpd.read_file(species_data_path)
-    except: # pylint:disable=W0702
+    except:  # pylint:disable=W0702
         sys.exit(f"Failed to read {species_data_path}")
-    taxid = filtered_species_info.id_no.values[0]
+    taxid = int(filtered_species_info.id_no.values[0])
     season = Season[filtered_species_info.season.values[0]]
 
     try:
@@ -99,30 +106,40 @@ def global_code_residents_pixel_ae(
 
     match season:
         case Season.RESIDENT:
-            filename = f"{taxid}_{season.name}.tif"
-            try:
-                current = open_layer_as_float64(os.path.join(current_aohs_path, filename))
-            except FileNotFoundError:
-                print(f"Failed to open current layer {os.path.join(current_aohs_path, filename)}")
+            current_path = find_layer_path(current_aohs_path, taxid, Season.RESIDENT)
+            if current_path is None:
+                print(f"Failed to find current layer for taxon {taxid} RESIDENT in {current_aohs_path}")
                 sys.exit()
 
+            historic_path = find_layer_path(historic_aohs_path, taxid, Season.RESIDENT)
+            if historic_path is None:
+                print(f"Failed to find historic layer for taxon {taxid} RESIDENT in {historic_aohs_path}")
+                sys.exit()
+
+            # Reuse the exact filename from the current layer for output
+            output_filename = current_path.name
+
             try:
-                scenario = open_layer_as_float64(os.path.join(scenario_aohs_path, filename))
+                current = open_layer_as_float64(str(current_path))
             except FileNotFoundError:
-                # If there is a current but now scenario file it's because the species went extinct under the scenario
+                print(f"Failed to open current layer {current_path}")
+                sys.exit()
+
+            scenario_path = find_layer_path(scenario_aohs_path, taxid, Season.RESIDENT)
+            try:
+                scenario = open_layer_as_float64(str(scenario_path) if scenario_path else "nan")
+            except FileNotFoundError:
                 scenario = ConstantLayer(0.0)
 
             try:
-                historic_aoh = RasterLayer.layer_from_file(os.path.join(historic_aohs_path, filename)).sum()
+                historic_aoh = RasterLayer.layer_from_file(str(historic_path)).sum()
             except FileNotFoundError:
-                print(f"Failed to open historic layer {os.path.join(historic_aohs_path, filename)}")
+                print(f"Failed to open historic layer {historic_path}")
                 sys.exit()
 
             if historic_aoh == 0.0:
                 print(f"Historic AoH for {taxid} is zero, aborting")
                 sys.exit()
-
-            # print(f"current: {current.sum()}\nscenario: {scenario.sum()}\nhistoric: {historic_aoh.sum()}")
 
             layers = [current, scenario]
             union = RasterLayer.find_union(layers)
@@ -142,17 +159,37 @@ def global_code_residents_pixel_ae(
             calc = new_p_layer - ConstantLayer(old_persistence)
 
             with TemporaryDirectory() as tmpdir:
-                tmpfile = os.path.join(tmpdir, filename)
+                tmpfile = os.path.join(tmpdir, output_filename)
                 with RasterLayer.empty_raster_layer_like(new_p_layer, filename=tmpfile) as delta_p:
                     calc.save(delta_p)
-                shutil.move(tmpfile, os.path.join(output_folder, filename))
+                shutil.move(tmpfile, os.path.join(output_folder, output_filename))
 
         case Season.NONBREEDING:
-            nonbreeding_filename = f"{taxid}_{Season.NONBREEDING.name}.tif"
-            breeding_filename = f"{taxid}_{Season.BREEDING.name}.tif"
+            current_breeding_path = find_layer_path(current_aohs_path, taxid, Season.BREEDING)
+            if current_breeding_path is None:
+                print(f"Failed to find current breeding layer for taxon {taxid} in {current_aohs_path}")
+                sys.exit()
+
+            current_non_breeding_path = find_layer_path(current_aohs_path, taxid, Season.NONBREEDING)
+            if current_non_breeding_path is None:
+                print(f"Failed to find current non-breeding layer for taxon {taxid} in {current_aohs_path}")
+                sys.exit()
+
+            historic_breeding_path = find_layer_path(historic_aohs_path, taxid, Season.BREEDING)
+            if historic_breeding_path is None:
+                print(f"Historic AoH for breeding {taxid} not found, aborting")
+                sys.exit()
+
+            historic_non_breeding_path = find_layer_path(historic_aohs_path, taxid, Season.NONBREEDING)
+            if historic_non_breeding_path is None:
+                print(f"Historic AoH for non breeding {taxid} not found, aborting")
+                sys.exit()
+
+            # Reuse the exact filename from the current non-breeding layer for output
+            output_filename = current_non_breeding_path.name
 
             try:
-                with RasterLayer.layer_from_file(os.path.join(historic_aohs_path, breeding_filename)) as aoh:
+                with RasterLayer.layer_from_file(str(historic_breeding_path)) as aoh:
                     historic_aoh_breeding = aoh.sum()
                 if historic_aoh_breeding == 0.0:
                     print(f"Historic AoH breeding for {taxid} is zero, aborting")
@@ -160,8 +197,9 @@ def global_code_residents_pixel_ae(
             except FileNotFoundError:
                 print(f"Historic AoH for breeding {taxid} not found, aborting")
                 sys.exit()
+
             try:
-                with RasterLayer.layer_from_file(os.path.join(historic_aohs_path, nonbreeding_filename)) as aoh:
+                with RasterLayer.layer_from_file(str(historic_non_breeding_path)) as aoh:
                     historic_aoh_non_breeding = aoh.sum()
                 if historic_aoh_non_breeding == 0.0:
                     print(f"Historic AoH for non breeding {taxid} is zero, aborting")
@@ -170,33 +208,26 @@ def global_code_residents_pixel_ae(
                 print(f"Historic AoH for non breeding {taxid} not found, aborting")
                 sys.exit()
 
-
-            if scenario_aohs_path != "nan":
-                non_breeding_scenario_path = os.path.join(scenario_aohs_path, nonbreeding_filename)
-                breeding_scenario_path = os.path.join(scenario_aohs_path, breeding_filename)
-            else:
-                non_breeding_scenario_path = "nan"
-                breeding_scenario_path = "nan"
+            scenario_breeding_path = find_layer_path(scenario_aohs_path, taxid, Season.BREEDING) if scenario_aohs_path != "nan" else None
+            scenario_non_breeding_path = find_layer_path(scenario_aohs_path, taxid, Season.NONBREEDING) if scenario_aohs_path != "nan" else None
 
             try:
-                current_breeding = open_layer_as_float64(os.path.join(current_aohs_path, breeding_filename))
+                current_breeding = open_layer_as_float64(str(current_breeding_path))
             except FileNotFoundError:
-                print(f"Failed to open current breeding {os.path.join(current_aohs_path, breeding_filename)}")
+                print(f"Failed to open current breeding {current_breeding_path}")
                 sys.exit()
             try:
-                current_non_breeding = open_layer_as_float64(os.path.join(current_aohs_path, nonbreeding_filename))
+                current_non_breeding = open_layer_as_float64(str(current_non_breeding_path))
             except FileNotFoundError:
-                print(f"Failed to open current non breeding {os.path.join(current_aohs_path, nonbreeding_filename)}")
+                print(f"Failed to open current non breeding {current_non_breeding_path}")
                 sys.exit()
             try:
-                scenario_breeding = open_layer_as_float64(breeding_scenario_path)
+                scenario_breeding = open_layer_as_float64(str(scenario_breeding_path) if scenario_breeding_path else "nan")
             except FileNotFoundError:
-                # If there is a current but now scenario file it's because the species went extinct under the scenario
                 scenario_breeding = ConstantLayer(0.0)
             try:
-                scenario_non_breeding = open_layer_as_float64(non_breeding_scenario_path)
+                scenario_non_breeding = open_layer_as_float64(str(scenario_non_breeding_path) if scenario_non_breeding_path else "nan")
             except FileNotFoundError:
-                # If there is a current but now scenario file it's because the species went extinct under the scenario
                 scenario_non_breeding = ConstantLayer(0.0)
 
             layers = [current_breeding, current_non_breeding, scenario_breeding, scenario_non_breeding]
@@ -242,13 +273,13 @@ def global_code_residents_pixel_ae(
             delta_p_layer = new_p_layer - ConstantLayer(old_persistence)
 
             with TemporaryDirectory() as tmpdir:
-                tmpfile = os.path.join(tmpdir, nonbreeding_filename)
+                tmpfile = os.path.join(tmpdir, output_filename)
                 with RasterLayer.empty_raster_layer_like(new_p_breeding, filename=tmpfile) as output:
                     delta_p_layer.save(output)
-                shutil.move(tmpfile, os.path.join(output_folder, nonbreeding_filename))
+                shutil.move(tmpfile, os.path.join(output_folder, output_filename))
 
         case Season.BREEDING:
-            pass # covered by the nonbreeding case
+            pass  # covered by the nonbreeding case
         case _:
             sys.exit(f"Unexpected season for species {taxid}: {season}")
 
